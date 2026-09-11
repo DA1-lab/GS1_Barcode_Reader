@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#111318" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>GS1 / Barcode Reader v0.3</title>
+  <title>GS1 / Barcode Reader v0.3.1</title>
   <style>
     :root {
       color-scheme: dark;
@@ -89,7 +89,7 @@
 <body>
 <div class="app">
   <header>
-    <div class="title">GS1 / Barcode Reader<span class="version">v0.3</span></div>
+    <div class="title">GS1 / Barcode Reader<span class="version">v0.3.1</span></div>
     <div id="status" class="status">ライブラリ読込中…</div>
   </header>
 
@@ -148,7 +148,7 @@
     </section>
 
     <div class="notice">
-      高速棚卸モード：GS1 DataBar / JAN・EAN / UPC / Code128 / ITFを複数同時に検出し、同じGTINでも画面上の位置が別なら別箱として数えます。画面内に置いたままの箱は再加算しません。<br>
+      高速棚卸モード：GS1 DataBar / JAN・EAN / UPC / Code128 / ITFを複数同時に検出し、同じGTINでも画面上の位置が別なら別箱として数えます。画面内に置いたままの箱は再加算せず、後続フレームで同じ箱の期限・Lotが取得できた場合は同じ履歴を更新します。<br>
       詳細モード：GS1 DataMatrix、PDF417 / MicroPDF417も探索します。GS1 Compositeの期限・Lot取得は無料ZXingでのベストエフォートです。カメラ利用にはHTTPSが必要です。
     </div>
   </main>
@@ -654,7 +654,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '0.3';
+  const APP_VERSION = '0.3.1';
   const ZXING_VERSION = '3.1.3';
   const FAST_SCAN_INTERVAL_MS = 70;
   const DETAIL_SCAN_INTERVAL_MS = 145;
@@ -662,6 +662,8 @@
   const REARM_MS = 900;
   const TRACK_LOST_MS = 950;
   const TRACK_MATCH_DISTANCE = 0.16;
+  const TRACK_AMBIGUITY_DISTANCE = 0.035;
+  const TRACK_VELOCITY_ALPHA = 0.45;
 
   const $ = (id) => document.getElementById(id);
   const video = $('video');
@@ -920,26 +922,11 @@
     return item.gtin || item.jan || item.raw || '—';
   }
 
-  function emit(item, bypassCodeDedupe = false) {
-    const now = performance.now();
-    const key = canonicalKey(item);
-    if (!bypassCodeDedupe) {
-      const last = lastSeenMap.get(key) || 0;
-      lastSeenMap.set(key, now);
-      if (now - last < REARM_MS) return false;
-    }
-
-    const entry = { ...item, at: new Date() };
-    history.unshift(entry);
-    history = history.slice(0, 50);
-    renderResult(entry);
-    renderHistory();
-    successFeedback();
-    acceptedCount++;
-    updateCountUI();
-
-    window.dispatchEvent(new CustomEvent('drugcode-scan', { detail: {
+  function eventDetail(entry, action) {
+    return {
       version: APP_VERSION,
+      action,
+      recordId: entry._id || null,
       kind: kindOf(entry),
       format: entry.format,
       raw: entry.raw,
@@ -953,8 +940,79 @@
       compositeRaw: entry.compositeRaw || null,
       serial: entry.serial || null,
       ai: entry.ai || {}
-    }}));
-    return true;
+    };
+  }
+
+  function emit(item, bypassCodeDedupe = false) {
+    const now = performance.now();
+    const key = canonicalKey(item);
+    if (!bypassCodeDedupe) {
+      const last = lastSeenMap.get(key) || 0;
+      lastSeenMap.set(key, now);
+      if (now - last < REARM_MS) return null;
+    }
+
+    const entry = {
+      ...item,
+      _id: crypto.randomUUID ? crypto.randomUUID() : `record-${Date.now()}-${Math.random()}`,
+      at: new Date(),
+      updatedAt: null
+    };
+    history.unshift(entry);
+    history = history.slice(0, 50);
+    renderResult(entry);
+    renderHistory();
+    successFeedback();
+    acceptedCount++;
+    updateCountUI();
+
+    window.dispatchEvent(new CustomEvent('drugcode-scan', { detail: eventDetail(entry, 'new') }));
+    return entry;
+  }
+
+  function hasDetailConflict(existing, incoming) {
+    for (const key of ['expiryRaw', 'lot', 'serial']) {
+      const a = existing?.[key] || '';
+      const b = incoming?.[key] || '';
+      if (a && b && a !== b) return true;
+    }
+    return false;
+  }
+
+  function updateExistingRecord(recordId, incoming) {
+    const index = history.findIndex(x => x._id === recordId);
+    if (index < 0) return { updated: false, conflict: false };
+    const current = history[index];
+    if ((current.gtin || '') !== (incoming.gtin || '') || hasDetailConflict(current, incoming)) {
+      return { updated: false, conflict: true };
+    }
+
+    const next = { ...current };
+    let changed = false;
+    for (const key of ['expiryRaw', 'expiry', 'expiryISO', 'lot', 'serial', 'compositeRaw']) {
+      if (!next[key] && incoming[key]) { next[key] = incoming[key]; changed = true; }
+    }
+    if (!next.linearRaw && incoming.linearRaw) { next.linearRaw = incoming.linearRaw; changed = true; }
+    if (!next.compositeMatched && incoming.compositeMatched) { next.compositeMatched = true; changed = true; }
+
+    const mergedAI = { ...(next.ai || {}) };
+    for (const [ai, value] of Object.entries(incoming.ai || {})) {
+      if (value && !mergedAI[ai]) { mergedAI[ai] = value; changed = true; }
+    }
+    next.ai = mergedAI;
+
+    if (completeness(incoming) > completeness(current)) {
+      if (incoming.raw && incoming.raw !== next.raw) { next.raw = incoming.raw; changed = true; }
+      if (incoming.format && incoming.format !== next.format) { next.format = incoming.format; changed = true; }
+    }
+
+    if (!changed) return { updated: false, conflict: false, entry: current };
+    next.updatedAt = new Date();
+    history[index] = next;
+    renderResult(next);
+    renderHistory();
+    window.dispatchEvent(new CustomEvent('drugcode-update', { detail: eventDetail(next, 'update') }));
+    return { updated: true, conflict: false, entry: next };
   }
 
   function successFeedback() {
@@ -1038,49 +1096,137 @@
     return { x: srcX / m.vw, y: srcY / m.vh };
   }
 
-  function processFastResults(results) {
+  function dedupeFrameDetections(detections) {
+    const unique = [];
+    for (const d of detections) {
+      const k = identityKey(d.item);
+      const index = unique.findIndex(u => {
+        if (identityKey(u.item) !== k) return false;
+        if (!u.center || !d.center) return true;
+        return Math.hypot(u.center.x - d.center.x, u.center.y - d.center.y) < 0.025;
+      });
+      if (index < 0) unique.push(d);
+      else if (completeness(d.item) > completeness(unique[index].item)) unique[index] = d;
+    }
+    return unique;
+  }
+
+  function predictedCenter(track, now) {
+    if (!track.center) return null;
+    const dt = Math.max(0, Math.min(250, now - track.lastSeen));
+    return {
+      x: track.center.x + (track.vx || 0) * dt,
+      y: track.center.y + (track.vy || 0) * dt
+    };
+  }
+
+  function updateTrackMotion(track, center, now) {
+    if (!center) { track.lastSeen = now; return; }
+    if (track.center && now > track.lastSeen) {
+      const dt = now - track.lastSeen;
+      const vx = (center.x - track.center.x) / dt;
+      const vy = (center.y - track.center.y) / dt;
+      track.vx = (track.vx || 0) * (1 - TRACK_VELOCITY_ALPHA) + vx * TRACK_VELOCITY_ALPHA;
+      track.vy = (track.vy || 0) * (1 - TRACK_VELOCITY_ALPHA) + vy * TRACK_VELOCITY_ALPHA;
+    }
+    track.center = center;
+    track.lastSeen = now;
+  }
+
+  function findTrackMatch(detection, usedTrackIds, now) {
+    if (!detection.center) return { track: null, blocked: false };
+    const key = identityKey(detection.item);
+    const spatial = [];
+    for (const t of activeTracks) {
+      if (usedTrackIds.has(t.id) || t.key !== key || !t.center || now - t.lastSeen > TRACK_LOST_MS) continue;
+      const predicted = predictedCenter(t, now);
+      const dist = Math.hypot(predicted.x - detection.center.x, predicted.y - detection.center.y);
+      if (dist < TRACK_MATCH_DISTANCE) spatial.push({ track: t, dist, conflict: hasDetailConflict(t.item || {}, detection.item) });
+    }
+    if (!spatial.length) return { track: null, blocked: false };
+    spatial.sort((a,b) => a.dist - b.dist);
+
+    const compatible = spatial.filter(x => !x.conflict);
+    if (!compatible.length) return { track: null, blocked: true, reason: 'detail-conflict' };
+    const best = compatible[0];
+    const second = compatible[1];
+    if (second && second.dist - best.dist < TRACK_AMBIGUITY_DISTANCE) {
+      return { track: null, blocked: true, reason: 'ambiguous-position' };
+    }
+    return { track: best.track, blocked: false };
+  }
+
+  function createTrackForDetection(d, now) {
+    const entry = emit(d.item, true);
+    if (!entry) return null;
+    const t = {
+      id: crypto.randomUUID ? crypto.randomUUID() : `${now}-${Math.random()}`,
+      key: identityKey(d.item),
+      center: d.center,
+      lastSeen: now,
+      vx: 0, vy: 0,
+      entryId: entry._id,
+      item: { ...d.item }
+    };
+    activeTracks.push(t);
+    return t;
+  }
+
+  function processTrackedDetections(detections) {
     const now = performance.now();
+    const unique = dedupeFrameDetections(detections);
+    const usedTrackIds = new Set();
+
+    for (const d of unique) {
+      if (!d.center) {
+        // 位置情報なしではGTINだけを根拠に既存箱へ統合しない。従来のコード単位デデュープのみ使用。
+        emit(d.item, false);
+        continue;
+      }
+      const match = findTrackMatch(d, usedTrackIds, now);
+      if (match.blocked) continue;
+      if (match.track) {
+        const t = match.track;
+        const update = updateExistingRecord(t.entryId, d.item);
+        if (update.conflict) continue;
+        if (update.entry) t.item = { ...update.entry };
+        else if (!hasDetailConflict(t.item || {}, d.item)) {
+          t.item = { ...(t.item || {}), ...d.item,
+            expiryRaw: t.item?.expiryRaw || d.item.expiryRaw || '',
+            expiry: t.item?.expiry || d.item.expiry || '',
+            expiryISO: t.item?.expiryISO || d.item.expiryISO || '',
+            lot: t.item?.lot || d.item.lot || '',
+            serial: t.item?.serial || d.item.serial || '',
+            compositeRaw: t.item?.compositeRaw || d.item.compositeRaw || null,
+            compositeMatched: !!(t.item?.compositeMatched || d.item.compositeMatched)
+          };
+        }
+        updateTrackMotion(t, d.center, now);
+        usedTrackIds.add(t.id);
+      } else {
+        const t = createTrackForDetection(d, now);
+        if (t) usedTrackIds.add(t.id);
+      }
+    }
+
+    activeTracks = activeTracks.filter(t => now - t.lastSeen <= TRACK_LOST_MS);
+    updateCountUI(unique.length);
+    if (unique.length) setStatus(`${unique.length}件検出 / 累計${acceptedCount}箱`, 'ok');
+    return unique.length;
+  }
+
+  function processFastResults(results) {
     const detections = (results || [])
       .filter(r => r && r.isValid !== false && !r.error)
       .map(r => ({ item: classifyResult(r), center: resultCenter(r) }))
       .filter(d => d.item.raw && (d.item.gtin || d.item.jan || /^DataBar|Code128|ITF/.test(d.item.format)))
       .filter(d => validGTIN(d.item.gtin || d.item.jan || ''));
+    return processTrackedDetections(detections);
+  }
 
-    // 同一フレームの同一位置重複だけ除外。内容が同じでも位置が違えば別箱。
-    const unique = [];
-    for (const d of detections) {
-      const k = identityKey(d.item);
-      const dup = unique.some(u => {
-        if (identityKey(u.item) !== k) return false;
-        if (!u.center || !d.center) return true;
-        return Math.hypot(u.center.x - d.center.x, u.center.y - d.center.y) < 0.025;
-      });
-      if (!dup) unique.push(d);
-    }
-
-    const usedTrackIds = new Set();
-    for (const d of unique) {
-      const key = identityKey(d.item);
-      let best = null, bestDist = Infinity;
-      if (d.center) {
-        for (const t of activeTracks) {
-          if (usedTrackIds.has(t.id) || t.key !== key || !t.center) continue;
-          const dist = Math.hypot(t.center.x - d.center.x, t.center.y - d.center.y);
-          if (dist < TRACK_MATCH_DISTANCE && dist < bestDist) { best = t; bestDist = dist; }
-        }
-      }
-      if (best) {
-        best.center = d.center; best.lastSeen = now; usedTrackIds.add(best.id);
-      } else {
-        const t = { id: crypto.randomUUID ? crypto.randomUUID() : `${now}-${Math.random()}`, key, center: d.center, lastSeen: now };
-        activeTracks.push(t); usedTrackIds.add(t.id);
-        emit(d.item, true);
-      }
-    }
-    activeTracks = activeTracks.filter(t => now - t.lastSeen <= TRACK_LOST_MS);
-    updateCountUI(unique.length);
-    if (unique.length) setStatus(`${unique.length}件検出 / 累計${acceptedCount}箱`, 'ok');
-    return unique.length;
+  function processDetailedResult(item) {
+    const detections = item && item.raw ? [{ item, center: resultCenter(item) }] : [];
+    return processTrackedDetections(detections);
   }
 
   function setFastMode(on) {
@@ -1228,7 +1374,7 @@
         processFastResults(results || []);
       } else {
         const item = chooseAndMerge(results || []);
-        if (item && item.raw) emit(item);
+        processDetailedResult(item);
       }
       cleanSeenMap();
     } catch (e) {
